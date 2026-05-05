@@ -6,6 +6,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import * as http from "node:http";
 import * as fs from "node:fs";
@@ -549,6 +550,26 @@ export default function (pi: ExtensionAPI) {
           details: { accepted: true, agentId: target.id },
         };
       }
+    },
+    renderCall(_args, theme, context) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      text.setText(
+        theme.fg("accent", theme.bold("📞 " + (_args.to as string))) +
+        (" " + theme.fg("muted", (_args.synchronous as boolean) ?? true ? "(sync)" : "(async)"))
+      );
+      return text;
+    },
+    renderResult(result, _options, theme, context) {
+      const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
+      const details = result.details as Record<string, unknown> | undefined;
+      if (details?.error) {
+        text.setText(theme.fg("error", `⚠ ${details.error}`));
+      } else if (details?.reply) {
+        text.setText(theme.fg("dim", `← ${(details.reply as string).slice(0, 200)}`));
+      } else if (details?.accepted) {
+        text.setText(theme.fg("muted", "📨 已发送"));
+      }
+      return text;
     },
   });
 
