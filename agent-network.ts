@@ -577,7 +577,7 @@ export default function (pi: ExtensionAPI) {
       } else if (details?.reply) {
         const reply = details.reply as string;
         if (expanded) {
-          text.setText(theme.fg("dim", "← " + reply));
+          text.setText(theme.fg("dim", "←\n" + reply));
         } else {
           const preview = reply.length > 200 ? reply.slice(0, 200) + "…" : reply;
           text.setText(
