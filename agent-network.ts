@@ -406,6 +406,8 @@ export default function (pi: ExtensionAPI) {
       // Mark busy
       updateOwnStatus("busy");
 
+      console.error("[agent-network] call received:", JSON.stringify({ from: callReq.from, to: callReq.to, fromRoles: callReq.fromRoles, sync: callReq.synchronous }));
+
       const senderRoles = callReq.fromRoles?.length
         ? callReq.fromRoles.join("、")
         : `(unknown, id=${callReq.from.slice(0, 8)})`;
@@ -553,6 +555,8 @@ export default function (pi: ExtensionAPI) {
         synchronous,
         fromRoles: currentRoles,
       };
+
+      console.error("[agent-network] call sending:", JSON.stringify({ to, fromRoles: currentRoles, targetId: target.id }));
 
       const result = await httpPost(target.host, target.port, requestBody);
 
