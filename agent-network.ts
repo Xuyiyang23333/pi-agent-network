@@ -211,12 +211,12 @@ export default function (pi: ExtensionAPI) {
       const trimmed = args.trim();
 
       if (trimmed === "--off") {
-        stopNetwork();
         pi.sendMessage({
           customType: ROLE_CUSTOM_TYPE,
           content: "你已退出 agent 网络，不再接受其他 agent 的调用。",
           display: true,
         });
+        stopNetwork();
         ctx.ui.notify("Roles cleared, left agent network", "info");
         return;
       }
@@ -248,12 +248,12 @@ export default function (pi: ExtensionAPI) {
       }
 
       if (newRoles.length === 0) {
-        stopNetwork();
         pi.sendMessage({
           customType: ROLE_CUSTOM_TYPE,
           content: "你已退出 agent 网络，不再接受其他 agent 的调用。",
           display: true,
         });
+        stopNetwork();
         ctx.ui.notify("Roles cleared, left agent network", "info");
         return;
       }
@@ -302,12 +302,12 @@ export default function (pi: ExtensionAPI) {
     async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
       const roles: string[] = params.roles;
       if (roles.length === 0) {
-        stopNetwork();
         pi.sendMessage({
           customType: ROLE_CUSTOM_TYPE,
           content: "你已退出 agent 网络，不再接受其他 agent 的调用。",
           display: true,
         });
+        stopNetwork();
         return {
           content: [{ type: "text", text: "All roles removed." }],
           details: {},
@@ -348,12 +348,12 @@ export default function (pi: ExtensionAPI) {
     description: "Remove all roles and leave the agent network.",
     parameters: Type.Object({}),
     async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-      stopNetwork();
       pi.sendMessage({
         customType: ROLE_CUSTOM_TYPE,
         content: "你已退出 agent 网络，不再接受其他 agent 的调用。",
         display: true,
       });
+      stopNetwork();
       return {
         content: [{ type: "text", text: "Left the agent network." }],
         details: {},
