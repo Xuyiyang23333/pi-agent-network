@@ -424,6 +424,9 @@ export default function (pi: ExtensionAPI) {
       "When you receive a message prefixed with [异步消息来自 ...], " +
       "the caller is NOT waiting. You may use the call tool later to respond " +
       "if needed.",
+      "After calling another agent with synchronous=false, do NOT wait or poll. " +
+      "Your message has been delivered. End your turn. Use check_reply later " +
+      "to see if a response has arrived.",
     ],
     parameters: Type.Object({
       to: Type.String({
@@ -573,6 +576,12 @@ export default function (pi: ExtensionAPI) {
       "Check for pending async replies from other agents. " +
       "Call this after using call() with synchronous=false. " +
       "Optionally filter by sender agent ID.",
+    promptSnippet: "Check for pending replies from async calls to other agents",
+    promptGuidelines: [
+      "After using call() with synchronous=false, the other agent may reply later. " +
+      "Use check_reply to retrieve any pending responses when you are ready to read them. " +
+      "Do NOT call check_reply in a loop — check once per turn or when the user asks.",
+    ],
     parameters: Type.Object({
       from: Type.Optional(Type.String({
         description: "Optional: filter by sender agent ID",
