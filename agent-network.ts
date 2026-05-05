@@ -338,7 +338,9 @@ export default function (pi: ExtensionAPI) {
       // Mark busy
       updateOwnStatus("busy");
 
-      const formattedMsg = `[来自 ${callReq.from} (${callReq.to})]\n${callReq.message}`;
+      const formattedMsg = callReq.synchronous
+        ? `[同步调用来自 ${callReq.from}，角色: ${callReq.to}]\n${callReq.message}`
+        : `[异步消息来自 ${callReq.from}，角色: ${callReq.to}]\n${callReq.message}`;
 
       if (callReq.synchronous) {
         pendingSyncResponse = res;
@@ -411,7 +413,18 @@ export default function (pi: ExtensionAPI) {
     description:
       "Call another agent in the network by its role name. " +
       "Use synchronous=true (default) to wait for a reply, " +
-      "or synchronous=false to send and continue without waiting.",
+      "or synchronous=false to send and continue without waiting. " +
+      "IMPORTANT: messages prefixed with [同步调用] are synchronous calls " +
+      "whose replies are forwarded automatically — respond directly, do NOT use the call tool.",
+    promptGuidelines: [
+      "When you receive a message prefixed with [同步调用来自 ...], " +
+      "the caller is waiting for your reply. Process the request and respond " +
+      "with your answer directly — your response text is forwarded automatically. " +
+      "Do NOT use the call tool to reply.",
+      "When you receive a message prefixed with [异步消息来自 ...], " +
+      "the caller is NOT waiting. You may use the call tool later to respond " +
+      "if needed.",
+    ],
     parameters: Type.Object({
       to: Type.String({
         description: "Target role name, e.g. 'reviewer', 'tester'",
