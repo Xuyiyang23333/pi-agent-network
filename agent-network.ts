@@ -361,6 +361,154 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
+  // ─── HTTP Client ───────────────────────────────────────
+
+  function httpPost(
+    host: string,
+    port: number,
+    body: CallRequest
+  ): Promise<CallResponse> {
+    return new Promise((resolve) => {
+      const data = JSON.stringify(body);
+      const req = http.request(
+        {
+          hostname: host,
+          port,
+          path: "/message",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(data),
+          },
+        },
+        (res) => {
+          let responseBody = "";
+          res.on("data", (chunk) => (responseBody += chunk));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(responseBody));
+            } catch {
+              resolve({ error: "invalid response" });
+            }
+          });
+        }
+      );
+
+      req.on("error", () => {
+        resolve({ error: "connection failed" });
+      });
+
+      req.write(data);
+      req.end();
+    });
+  }
+
+  // ─── call Tool ─────────────────────────────────────────
+
+  pi.registerTool({
+    name: "call",
+    label: "Call Agent",
+    description:
+      "Call another agent in the network by its role name. " +
+      "Use synchronous=true (default) to wait for a reply, " +
+      "or synchronous=false to send and continue without waiting.",
+    parameters: Type.Object({
+      to: Type.String({
+        description: "Target role name, e.g. 'reviewer', 'tester'",
+      }),
+      message: Type.String({
+        description: "Message to send to the target agent",
+      }),
+      synchronous: Type.Optional(Type.Boolean({
+        description: "Wait for reply (true, default) or fire-and-forget (false)",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const to: string = params.to;
+      const message: string = params.message;
+      const synchronous: boolean = params.synchronous ?? true;
+
+      // Deadlock prevention: mark self BUSY before blocking on outbound sync call
+      if (synchronous) {
+        updateOwnStatus("busy");
+      }
+
+      // Find target
+      const agents = scanRegistry();
+      const candidates = agents.filter(
+        (a) =>
+          a.status !== "offline" &&
+          a.roles.includes(to) &&
+          a.id !== AGENT_ID
+      );
+
+      if (candidates.length === 0) {
+        if (synchronous) updateOwnStatus("idle");
+        return {
+          content: [{
+            type: "text",
+            text: `没有找到可用的 '${to}' 角色的 agent。`,
+          }],
+          details: { error: `no ${to} agent available` },
+        };
+      }
+
+      // Prefer idle
+      const idleCandidates = candidates.filter((a) => a.status === "idle");
+      const target = idleCandidates.length > 0
+        ? idleCandidates[Math.floor(Math.random() * idleCandidates.length)]
+        : candidates[0];
+
+      const requestBody: CallRequest = {
+        from: AGENT_ID,
+        to,
+        message,
+        synchronous,
+      };
+
+      const result = await httpPost(target.host, target.port, requestBody);
+
+      if (result.error === "busy") {
+        if (synchronous) updateOwnStatus("idle");
+        return {
+          content: [{
+            type: "text",
+            text: `${to} (${target.id}) 正忙，请稍后重试。`,
+          }],
+          details: { error: "busy", agentId: target.id },
+        };
+      }
+
+      if (result.error) {
+        markOffline(target.id);
+        if (synchronous) updateOwnStatus("idle");
+        return {
+          content: [{
+            type: "text",
+            text: `${to} (${target.id}) 无法连接，已标记为离线。`,
+          }],
+          details: { error: "connection failed", agentId: target.id },
+        };
+      }
+
+      if (synchronous) {
+        updateOwnStatus("idle");
+        return {
+          content: [{ type: "text", text: result.reply || "(empty reply)" }],
+          details: { reply: result.reply, from: target.id },
+        };
+      } else {
+        return {
+          content: [{
+            type: "text",
+            text: `已发送给 ${to} (${target.id})`,
+          }],
+          details: { accepted: true, agentId: target.id },
+        };
+      }
+    },
+  });
+
   // ─── Capture & Forward Replies ─────────────────────────
 
   function extractText(message: unknown): string {
