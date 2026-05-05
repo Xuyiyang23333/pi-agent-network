@@ -406,14 +406,12 @@ export default function (pi: ExtensionAPI) {
       // Mark busy
       updateOwnStatus("busy");
 
-      console.error("[agent-network] call received:", JSON.stringify({ from: callReq.from, to: callReq.to, fromRoles: callReq.fromRoles, sync: callReq.synchronous }));
-
       const senderRoles = callReq.fromRoles?.length
         ? callReq.fromRoles.join("、")
         : `(unknown, id=${callReq.from.slice(0, 8)})`;
       const formattedMsg = callReq.synchronous
-        ? `[v3·同步] 来自 ${callReq.from.slice(0, 8)}，发送方角色: ${senderRoles}\n${callReq.message}`
-        : `[v3·异步] 来自 ${callReq.from.slice(0, 8)}，发送方角色: ${senderRoles}\n${callReq.message}`;
+        ? `[同步调用] 来自 ${callReq.from.slice(0, 8)}，发送方: ${senderRoles}\n${callReq.message}`
+        : `[异步消息] 来自 ${callReq.from.slice(0, 8)}，发送方: ${senderRoles}\n${callReq.message}`;
 
       if (callReq.synchronous) {
         pendingSyncResponse = res;
@@ -487,14 +485,14 @@ export default function (pi: ExtensionAPI) {
       "Call another agent in the network by its role name. " +
       "Use synchronous=true (default) to wait for a reply, " +
       "or synchronous=false to send and continue without waiting. " +
-      "IMPORTANT: messages prefixed with [v3·同步] are synchronous calls " +
+      "IMPORTANT: messages prefixed with [同步调用] are synchronous calls " +
       "whose replies are forwarded automatically — respond directly, do NOT use the call tool.",
     promptGuidelines: [
-      "When you receive a message prefixed with [v3·同步] 来自 ..., " +
+      "When you receive a message prefixed with [同步调用] 来自 ..., " +
       "the caller is waiting for your reply. Process the request and respond " +
       "with your answer directly — your response text is forwarded automatically. " +
       "Do NOT use the call tool to reply.",
-      "When you receive a message prefixed with [v3·异步] 来自 ..., " +
+      "When you receive a message prefixed with [异步消息] 来自 ..., " +
       "the caller is NOT waiting. You may use the call tool later to respond " +
       "if needed.",
       "After calling another agent with synchronous=false, do NOT wait or poll. " +
@@ -555,8 +553,6 @@ export default function (pi: ExtensionAPI) {
         synchronous,
         fromRoles: currentRoles,
       };
-
-      console.error("[agent-network] call sending:", JSON.stringify({ to, fromRoles: currentRoles, targetId: target.id }));
 
       const result = await httpPost(target.host, target.port, requestBody);
 
