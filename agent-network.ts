@@ -32,6 +32,9 @@ interface CallRequest {
   message: string;
   synchronous: boolean;
   fromRoles?: string[];
+  replyHost?: string;
+  replyPort?: number;
+  isReply?: boolean;
 }
 
 interface CallResponse {
@@ -395,6 +398,16 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
+      // Fast path: incoming async reply — store directly, no LLM processing
+      if (callReq.isReply) {
+        const replies = pendingReplies.get(callReq.from) || [];
+        replies.push({ from: callReq.from, reply: callReq.message, timestamp: Date.now() });
+        pendingReplies.set(callReq.from, replies);
+        res.writeHead(200);
+        res.end(JSON.stringify({ accepted: true }));
+        return;
+      }
+
       // Check if we're busy
       const ownInfo = readOwnRegistry();
       if (ownInfo && ownInfo.status === "busy") {
@@ -423,10 +436,25 @@ export default function (pi: ExtensionAPI) {
         res.writeHead(202);
         res.end(JSON.stringify({ accepted: true }));
 
-        pendingSyncResolve = (reply: string) => {
-          const replies = pendingReplies.get(callReq.from) || [];
-          replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
-          pendingReplies.set(callReq.from, replies);
+        // If caller provided reply address, POST the reply back directly.
+        // Otherwise fall back to storing locally (backward compat with old callers).
+        if (callReq.replyHost && callReq.replyPort) {
+          pendingSyncResolve = (reply: string) => {
+            httpPost(callReq.replyHost as string, callReq.replyPort as number, {
+              from: AGENT_ID,
+              to: callReq.from,
+              message: reply,
+              synchronous: false,
+              fromRoles: currentRoles,
+              isReply: true,
+            });
+          };
+        } else {
+          pendingSyncResolve = (reply: string) => {
+            const replies = pendingReplies.get(callReq.from) || [];
+            replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
+            pendingReplies.set(callReq.from, replies);
+          };
         };
 
         pi.sendUserMessage(formattedMsg);
@@ -552,6 +580,7 @@ export default function (pi: ExtensionAPI) {
         message,
         synchronous,
         fromRoles: currentRoles,
+        ...(synchronous ? {} : { replyHost: "127.0.0.1", replyPort: serverPort }),
       };
 
       const result = await httpPost(target.host, target.port, requestBody);
