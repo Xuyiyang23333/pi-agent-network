@@ -552,10 +552,17 @@ export default function (pi: ExtensionAPI) {
       }
     },
     renderCall(_args, theme, context) {
+      const to = (_args.to as string) || "?";
+      const sync = (_args.synchronous as boolean) ?? true;
+      const msg = (_args.message as string) || "";
+      const mode = sync ? "(sync)" : "(async)";
+      const displayMsg = msg.length > 300 ? msg.slice(0, 300) + "…" : msg;
+
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       text.setText(
-        theme.fg("accent", theme.bold("📞 " + (_args.to as string))) +
-        (" " + theme.fg("muted", (_args.synchronous as boolean) ?? true ? "(sync)" : "(async)"))
+        theme.fg("accent", theme.bold("📞 " + to)) +
+        " " + theme.fg("muted", mode) +
+        (displayMsg ? "\n" + theme.fg("dim", displayMsg) : "")
       );
       return text;
     },
