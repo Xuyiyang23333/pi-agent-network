@@ -131,6 +131,9 @@ export default function (pi: ExtensionAPI) {
     if (!fs.existsSync(p)) return;
     try {
       const info: AgentInfo = JSON.parse(fs.readFileSync(p, "utf-8"));
+      // NOTE: read-modify-write is not atomic — if the target agent
+      // simultaneously updates its own status, offline may overwrite idle.
+      // Probability is negligible in local single-machine scenarios.
       info.status = "offline";
       fs.writeFileSync(p, JSON.stringify(info, null, 2));
     } catch {
@@ -280,7 +283,7 @@ export default function (pi: ExtensionAPI) {
         });
         pi.appendEntry(ROLE_CUSTOM_TYPE, { roles: currentRoles });
       } else {
-        startNetwork(roles);
+        await startNetwork(roles);
       }
       return {
         content: [{
@@ -316,6 +319,10 @@ export default function (pi: ExtensionAPI) {
     }
 
     let body = "";
+    req.on("error", () => {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: "request error" }));
+    });
     req.on("data", (chunk) => (body += chunk));
     req.on("end", () => {
       let callReq: CallRequest;
@@ -324,6 +331,18 @@ export default function (pi: ExtensionAPI) {
       } catch {
         res.writeHead(400);
         res.end(JSON.stringify({ error: "invalid json" }));
+        return;
+      }
+
+      // Validate required fields
+      if (
+        typeof callReq.from !== "string" ||
+        typeof callReq.to !== "string" ||
+        typeof callReq.message !== "string" ||
+        typeof callReq.synchronous !== "boolean"
+      ) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "missing required fields" }));
         return;
       }
 
@@ -651,7 +670,7 @@ export default function (pi: ExtensionAPI) {
               "text" in b && typeof (b as { text: unknown }).text === "string"
           )
           .map((b) => (b as { text: string }).text)
-          .join("\n");
+          .join("\n") || "(no response)";
       }
     }
     return "(no response)";
@@ -666,7 +685,7 @@ export default function (pi: ExtensionAPI) {
     const lastAssistant = assistantMessages[assistantMessages.length - 1];
     const replyText = extractText(lastAssistant);
 
-    // Sync: send HTTP response
+    // Sync: send HTTP response (sync and async are mutually exclusive by design)
     if (pendingSyncResponse) {
       if (pendingSyncResponse.writable) {
         pendingSyncResponse.writeHead(200, {
@@ -676,10 +695,8 @@ export default function (pi: ExtensionAPI) {
       }
       pendingSyncResponse = null;
       updateOwnStatus("idle");
-    }
-
-    // Async: stash to pending queue
-    if (pendingSyncResolve) {
+    } else if (pendingSyncResolve) {
+      // Async: stash to pending queue
       pendingSyncResolve(replyText);
       pendingSyncResolve = null;
       updateOwnStatus("idle");
@@ -703,7 +720,7 @@ export default function (pi: ExtensionAPI) {
     }
 
     if (lastRole && lastRole.roles.length > 0) {
-      startNetwork(lastRole.roles);
+      await startNetwork(lastRole.roles);
       if (ctx.hasUI) {
         ctx.ui.notify(
           `Restored roles from session: ${lastRole.roles.join(", ")}`,
