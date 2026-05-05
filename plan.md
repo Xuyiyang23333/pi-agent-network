@@ -1,0 +1,881 @@
+# pi-agent-network 实现计划
+
+> **For agentic workers:** Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** 实现一个 pi 扩展，让多个 pi 实例通过 P2P HTTP 互相调用，像 function call 一样协作。
+
+**Architecture:** 单文件扩展 `agent-network.ts`。文件系统 registry 做服务发现，内嵌 HTTP server/client 做通信，TypeBox 注册工具暴露给 LLM。
+
+**Tech Stack:** TypeScript（pi 原生），`node:http` / `node:fs` / `node:path` / `node:os` / `node:crypto`，TypeBox（pi 内置），零外部依赖。
+
+**审查修正清单：** ✅ 死锁预防 ✅ 端口 listen(0) ✅ writable 检查 ✅ API 签名对齐 ✅ UUID ✅ 路径统一 ✅ extractText 安全 ✅ 异步回复 TTL
+
+---
+
+## 文件结构
+
+```
+~/.pi/agent-network/
+  agent-network.ts          # 唯一文件
+
+~/.pi/agent/registry/       # 所有 agent 共同维护
+  <id>.json                 # 注册文件
+
+~/.pi/agent/extensions/
+  agent-network.ts          # symlink → ../../agent-network/agent-network.ts
+```
+
+---
+
+### Task 1: 扩展骨架、类型、常量
+
+**Files:** Create `~/.pi/agent-network/agent-network.ts`
+
+- [ ] **Step 1: 写入骨架**
+
+```typescript
+/**
+ * pi-agent-network — P2P multi-agent collaboration
+ *
+ * Agents discover each other via ~/.pi/agent/registry/ and communicate
+ * via HTTP. The LLM calls other agents through the `call` tool.
+ */
+
+import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { Type } from "typebox";
+import * as http from "node:http";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import * as os from "node:os";
+import { randomUUID } from "node:crypto";
+
+// ─── Types ───────────────────────────────────────────────
+
+interface AgentInfo {
+  id: string;
+  roles: string[];
+  host: string;
+  port: number;
+  status: "idle" | "busy" | "offline";
+  startedAt: number;
+}
+
+interface CallRequest {
+  from: string;
+  to: string;
+  message: string;
+  synchronous: boolean;
+}
+
+interface CallResponse {
+  reply?: string;
+  error?: string;
+  accepted?: boolean;
+}
+
+interface PendingReply {
+  from: string;
+  reply: string;
+  timestamp: number;
+}
+
+interface RoleData {
+  roles: string[];
+}
+
+// ─── Constants ───────────────────────────────────────────
+
+const REGISTRY_DIR = path.join(os.homedir(), ".pi", "agent", "registry");
+const ROLE_CUSTOM_TYPE = "agent-network-role";
+const AGENT_ID = randomUUID();
+const REPLY_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+export default function (pi: ExtensionAPI) {
+  // ─── Module State ──────────────────────────────────────
+
+  let currentRoles: string[] = [];
+  let httpServer: http.Server | null = null;
+  let serverPort: number = 0;
+
+  // Incoming synchronous call: resolve when agent_end fires
+  let pendingSyncResolve: ((reply: string) => void) | null = null;
+  let pendingSyncResponse: http.ServerResponse | null = null;
+
+  // Pending async replies: Map<callerId, PendingReply[]>
+  const pendingReplies = new Map<string, PendingReply[]>();
+```
+
+- [ ] **Step 2: 验证加载**
+
+```bash
+ln -sf ~/.pi/agent-network/agent-network.ts ~/.pi/agent/extensions/agent-network.ts
+pi
+# 预期：启动 header 显示扩展已加载，无报错
+```
+
+---
+
+### Task 2: Registry 管理函数
+
+**继续在 agent-network.ts 中，`export default` 闭包内添加：**
+
+- [ ] **Step 1: 基础读写**
+
+```typescript
+  // ─── Registry Helpers ──────────────────────────────────
+
+  function ensureRegistryDir(): void {
+    if (!fs.existsSync(REGISTRY_DIR)) {
+      fs.mkdirSync(REGISTRY_DIR, { recursive: true });
+    }
+  }
+
+  function registryPath(id: string): string {
+    return path.join(REGISTRY_DIR, `${id}.json`);
+  }
+
+  function readOwnRegistry(): AgentInfo | null {
+    const p = registryPath(AGENT_ID);
+    if (!fs.existsSync(p)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(p, "utf-8"));
+    } catch {
+      return null;
+    }
+  }
+
+  function writeOwnRegistry(info: AgentInfo): void {
+    ensureRegistryDir();
+    fs.writeFileSync(registryPath(AGENT_ID), JSON.stringify(info, null, 2));
+  }
+
+  function deleteOwnRegistry(): void {
+    const p = registryPath(AGENT_ID);
+    if (fs.existsSync(p)) fs.unlinkSync(p);
+  }
+
+  function updateOwnStatus(status: "idle" | "busy" | "offline"): void {
+    const info = readOwnRegistry();
+    if (!info) return;
+    info.status = status;
+    writeOwnRegistry(info);
+  }
+```
+
+- [ ] **Step 2: 扫描与标记离线**
+
+```typescript
+  function scanRegistry(): AgentInfo[] {
+    ensureRegistryDir();
+    const agents: AgentInfo[] = [];
+    for (const file of fs.readdirSync(REGISTRY_DIR)) {
+      if (!file.endsWith(".json")) continue;
+      try {
+        const data = JSON.parse(
+          fs.readFileSync(path.join(REGISTRY_DIR, file), "utf-8")
+        );
+        if (data.id && Array.isArray(data.roles)) {
+          agents.push(data);
+        }
+      } catch {
+        // corrupt file, skip
+      }
+    }
+    return agents;
+  }
+
+  function markOffline(agentId: string): void {
+    const p = registryPath(agentId);
+    if (!fs.existsSync(p)) return;
+    try {
+      const info: AgentInfo = JSON.parse(fs.readFileSync(p, "utf-8"));
+      info.status = "offline";
+      fs.writeFileSync(p, JSON.stringify(info, null, 2));
+    } catch {
+      // ignore — file may be corrupted or deleted concurrently
+    }
+  }
+```
+
+---
+
+### Task 3: 角色管理
+
+- [ ] **Step 1: 注册与注销核心逻辑**
+
+```typescript
+  // ─── Role Management ───────────────────────────────────
+
+  function startNetwork(roles: string[]): void {
+    ensureRegistryDir();
+
+    // Start HTTP server on port 0 — OS assigns a free port
+    httpServer = http.createServer(handleRequest);
+    httpServer.listen(0, "127.0.0.1", () => {
+      const addr = httpServer!.address();
+      if (!addr || typeof addr === "string") {
+        throw new Error("Failed to get server address");
+      }
+      serverPort = addr.port;
+
+      const info: AgentInfo = {
+        id: AGENT_ID,
+        roles,
+        host: "127.0.0.1",
+        port: serverPort,
+        status: "idle",
+        startedAt: Date.now(),
+      };
+      writeOwnRegistry(info);
+    });
+
+    currentRoles = roles;
+    pi.appendEntry(ROLE_CUSTOM_TYPE, { roles } satisfies RoleData);
+  }
+
+  function stopNetwork(): void {
+    if (httpServer) {
+      httpServer.close();
+      httpServer = null;
+      serverPort = 0;
+    }
+    deleteOwnRegistry();
+    currentRoles = [];
+    pendingSyncResponse = null;
+    pendingSyncResolve = null;
+  }
+```
+
+- [ ] **Step 2: `/role` 命令**
+
+```typescript
+  pi.registerCommand("role", {
+    description: "Assign or remove agent roles. Usage: /role <name,...>, /role +name, /role -name, /role --off",
+    handler: async (args, ctx) => {
+      const trimmed = args.trim();
+
+      if (trimmed === "--off") {
+        stopNetwork();
+        ctx.ui.notify("Roles cleared, left agent network", "info");
+        return;
+      }
+
+      if (!trimmed) {
+        if (currentRoles.length > 0) {
+          ctx.ui.notify(
+            `Current roles: ${currentRoles.join(", ")} (port ${serverPort})`,
+            "info"
+          );
+        } else {
+          ctx.ui.notify(
+            "No roles assigned. Use /role <name,...> to join the network",
+            "info"
+          );
+        }
+        return;
+      }
+
+      // Parse: "/role developer, tester" or "/role +designer" or "/role -tester"
+      let newRoles: string[];
+      if (trimmed.startsWith("+")) {
+        const delta = trimmed.slice(1).split(",").map(s => s.trim()).filter(Boolean);
+        newRoles = [...new Set([...currentRoles, ...delta])];
+      } else if (trimmed.startsWith("-")) {
+        const delta = trimmed.slice(1).split(",").map(s => s.trim()).filter(Boolean);
+        newRoles = currentRoles.filter(r => !delta.includes(r));
+      } else {
+        newRoles = [...new Set(trimmed.split(",").map(s => s.trim()).filter(Boolean))];
+      }
+
+      if (newRoles.length === 0) {
+        stopNetwork();
+        ctx.ui.notify("Roles cleared, left agent network", "info");
+        return;
+      }
+
+      if (serverPort > 0) {
+        // Already online — update in place
+        currentRoles = newRoles;
+        writeOwnRegistry({
+          id: AGENT_ID,
+          roles: newRoles,
+          host: "127.0.0.1",
+          port: serverPort,
+          status: "idle",
+          startedAt: Date.now(),
+        });
+        pi.appendEntry(ROLE_CUSTOM_TYPE, { roles: newRoles });
+        ctx.ui.notify(`Roles updated: ${newRoles.join(", ")}`, "info");
+      } else {
+        // First time
+        startNetwork(newRoles);
+        // Port is assigned async — notify optimistically
+        ctx.ui.notify(
+          `Joining agent network as: ${newRoles.join(", ")}`,
+          "info"
+        );
+      }
+    },
+  });
+```
+
+- [ ] **Step 3: `set_role` 和 `unset_role` 工具**
+
+```typescript
+  pi.registerTool({
+    name: "set_role",
+    label: "Set Role",
+    description:
+      "Register yourself with one or more roles in the agent network. " +
+      "Roles are user-defined labels like 'developer', 'reviewer', 'tester'. " +
+      "After setting a role, other agents can discover and call you.",
+    parameters: Type.Object({
+      roles: Type.Array(Type.String(), {
+        description: "List of role names to register",
+      }),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const roles: string[] = params.roles;
+      if (roles.length === 0) {
+        stopNetwork();
+        return {
+          content: [{ type: "text", text: "All roles removed." }],
+          details: {},
+        };
+      }
+      if (serverPort > 0) {
+        currentRoles = [...new Set(roles)];
+        writeOwnRegistry({
+          id: AGENT_ID,
+          roles: currentRoles,
+          host: "127.0.0.1",
+          port: serverPort,
+          status: "idle",
+          startedAt: Date.now(),
+        });
+        pi.appendEntry(ROLE_CUSTOM_TYPE, { roles: currentRoles });
+      } else {
+        startNetwork(roles);
+      }
+      return {
+        content: [{
+          type: "text",
+          text: `Roles set: ${currentRoles.join(", ")} (port ${serverPort})`,
+        }],
+        details: { roles: currentRoles, port: serverPort },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "unset_role",
+    label: "Unset Role",
+    description: "Remove all roles and leave the agent network.",
+    parameters: Type.Object({}),
+    async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
+      stopNetwork();
+      return {
+        content: [{ type: "text", text: "Left the agent network." }],
+        details: {},
+      };
+    },
+  });
+```
+
+---
+
+### Task 4: HTTP Server（接收调用）
+
+- [ ] **Step 1: 请求处理函数**
+
+```typescript
+  // ─── HTTP Server ───────────────────────────────────────
+
+  function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (req.method !== "POST" || req.url !== "/message") {
+      res.writeHead(404);
+      res.end("not found");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      let callReq: CallRequest;
+      try {
+        callReq = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "invalid json" }));
+        return;
+      }
+
+      // Check if we're busy
+      const ownInfo = readOwnRegistry();
+      if (ownInfo && ownInfo.status === "busy") {
+        res.writeHead(409);
+        res.end(JSON.stringify({ error: "busy" }));
+        return;
+      }
+
+      // Mark busy
+      updateOwnStatus("busy");
+
+      const formattedMsg = `[来自 ${callReq.from} (${callReq.to})]\n${callReq.message}`;
+
+      if (callReq.synchronous) {
+        pendingSyncResponse = res;
+        pendingSyncResolve = null;
+        pi.sendUserMessage(formattedMsg);
+        // Response is sent in agent_end handler
+      } else {
+        // Async: accept immediately
+        res.writeHead(202);
+        res.end(JSON.stringify({ accepted: true }));
+
+        // Prepare to collect reply
+        pendingSyncResolve = (reply: string) => {
+          const replies = pendingReplies.get(callReq.from) || [];
+          replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
+          pendingReplies.set(callReq.from, replies);
+        };
+
+        pi.sendUserMessage(formattedMsg);
+      }
+    });
+  }
+```
+
+- [ ] **Step 2: `agent_end` 钩子——写回回复**
+
+```typescript
+  // ─── Lifecycle: Capture & Forward Replies ──────────────
+
+  pi.on("agent_end", async (event) => {
+    if (!pendingSyncResponse && !pendingSyncResolve) return;
+
+    // Extract final assistant text (no reasoning, no tool calls)
+    const assistantMessages = (event.messages as Array<{ role: string; content?: unknown }>).filter(
+      (m) => m.role === "assistant"
+    );
+    const lastAssistant = assistantMessages[assistantMessages.length - 1];
+    const replyText = extractText(lastAssistant);
+
+    // Sync: send HTTP response
+    if (pendingSyncResponse) {
+      if (pendingSyncResponse.writable) {
+        pendingSyncResponse.writeHead(200, {
+          "Content-Type": "application/json",
+        });
+        pendingSyncResponse.end(JSON.stringify({ reply: replyText }));
+      }
+      pendingSyncResponse = null;
+      updateOwnStatus("idle");
+    }
+
+    // Async: stash to pending queue
+    if (pendingSyncResolve) {
+      pendingSyncResolve(replyText);
+      pendingSyncResolve = null;
+      updateOwnStatus("idle");
+    }
+  });
+
+  function extractText(message: unknown): string {
+    if (!message) return "(no response)";
+    if (typeof message === "string") return message;
+    if (typeof message === "object" && message !== null && "content" in message) {
+      const content = (message as { content: unknown }).content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        return content
+          .filter(
+            (b: unknown) =>
+              typeof b === "object" && b !== null &&
+              "type" in b && (b as { type: string }).type === "text" &&
+              "text" in b && typeof (b as { text: unknown }).text === "string"
+          )
+          .map((b) => (b as { text: string }).text)
+          .join("\n");
+      }
+    }
+    return "(no response)";
+  }
+```
+
+---
+
+### Task 5: `call` 工具与 HTTP client
+
+- [ ] **Step 1: `call` 工具**
+
+```typescript
+  // ─── call Tool ─────────────────────────────────────────
+
+  pi.registerTool({
+    name: "call",
+    label: "Call Agent",
+    description:
+      "Call another agent in the network by its role name. " +
+      "Use synchronous=true (default) to wait for a reply, " +
+      "or synchronous=false to send and continue without waiting.",
+    parameters: Type.Object({
+      to: Type.String({
+        description: "Target role name, e.g. 'reviewer', 'tester'",
+      }),
+      message: Type.String({
+        description: "Message to send to the target agent",
+      }),
+      synchronous: Type.Optional(Type.Boolean({
+        description: "Wait for reply (true, default) or fire-and-forget (false)",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const to: string = params.to;
+      const message: string = params.message;
+      const synchronous: boolean = params.synchronous ?? true;
+
+      // Deadlock prevention: mark self BUSY before blocking on outbound sync call
+      if (synchronous) {
+        updateOwnStatus("busy");
+      }
+
+      // Find target
+      const agents = scanRegistry();
+      const candidates = agents.filter(
+        (a) =>
+          a.status !== "offline" &&
+          a.roles.includes(to) &&
+          a.id !== AGENT_ID
+      );
+
+      if (candidates.length === 0) {
+        if (synchronous) updateOwnStatus("idle");
+        return {
+          content: [{
+            type: "text",
+            text: `没有找到可用的 '${to}' 角色的 agent。`,
+          }],
+          details: { error: `no ${to} agent available` },
+        };
+      }
+
+      // Prefer idle
+      const idleCandidates = candidates.filter((a) => a.status === "idle");
+      const target = idleCandidates.length > 0
+        ? idleCandidates[Math.floor(Math.random() * idleCandidates.length)]
+        : candidates[0];
+
+      // Make HTTP request
+      const requestBody: CallRequest = {
+        from: AGENT_ID,
+        to,
+        message,
+        synchronous,
+      };
+
+      const result = await httpPost(target.host, target.port, requestBody);
+
+      if (result.error === "busy") {
+        if (synchronous) updateOwnStatus("idle");
+        return {
+          content: [{
+            type: "text",
+            text: `${to} (${target.id}) 正忙，请稍后重试。`,
+          }],
+          details: { error: "busy", agentId: target.id },
+        };
+      }
+
+      if (result.error) {
+        // Connection failed — mark offline
+        markOffline(target.id);
+        if (synchronous) updateOwnStatus("idle");
+        return {
+          content: [{
+            type: "text",
+            text: `${to} (${target.id}) 无法连接，已标记为离线。`,
+          }],
+          details: { error: "connection failed", agentId: target.id },
+        };
+      }
+
+      if (synchronous) {
+        updateOwnStatus("idle");
+        return {
+          content: [{ type: "text", text: result.reply || "(empty reply)" }],
+          details: { reply: result.reply, from: target.id },
+        };
+      } else {
+        return {
+          content: [{
+            type: "text",
+            text: `已发送给 ${to} (${target.id})`,
+          }],
+          details: { accepted: true, agentId: target.id },
+        };
+      }
+    },
+  });
+```
+
+- [ ] **Step 2: `httpPost` 辅助函数**
+
+```typescript
+  // ─── HTTP Client ───────────────────────────────────────
+
+  function httpPost(
+    host: string,
+    port: number,
+    body: CallRequest
+  ): Promise<CallResponse> {
+    return new Promise((resolve) => {
+      const data = JSON.stringify(body);
+      const req = http.request(
+        {
+          hostname: host,
+          port,
+          path: "/message",
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Content-Length": Buffer.byteLength(data),
+          },
+        },
+        (res) => {
+          let responseBody = "";
+          res.on("data", (chunk) => (responseBody += chunk));
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(responseBody));
+            } catch {
+              resolve({ error: "invalid response" });
+            }
+          });
+        }
+      );
+
+      req.on("error", () => {
+        resolve({ error: "connection failed" });
+      });
+
+      req.write(data);
+      req.end();
+    });
+  }
+```
+
+---
+
+### Task 6: `list_agents` 与 `check_reply`
+
+- [ ] **Step 1: `list_agents`**
+
+```typescript
+  // ─── list_agents Tool ──────────────────────────────────
+
+  pi.registerTool({
+    name: "list_agents",
+    label: "List Agents",
+    description:
+      "List all agents currently in the network. " +
+      "Optionally filter by role (e.g. 'reviewer'). " +
+      "Returns agent ID, roles, status, and uptime.",
+    parameters: Type.Object({
+      role: Type.Optional(Type.String({
+        description: "Optional: filter by role name",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const role: string | undefined = params.role;
+      const agents = scanRegistry();
+      const filtered = role
+        ? agents.filter((a) => a.roles.includes(role))
+        : agents;
+
+      return {
+        content: [{
+          type: "text",
+          text: filtered.length === 0
+            ? "没有找到 agent。"
+            : filtered.map((a) =>
+                `[${a.status}] ${a.id} — ${a.roles.join(", ")} (${Math.round((Date.now() - a.startedAt) / 1000)}s)`
+              ).join("\n"),
+        }],
+        details: {
+          agents: filtered.map((a) => ({
+            id: a.id,
+            roles: a.roles,
+            status: a.status,
+            uptime: Math.round((Date.now() - a.startedAt) / 1000),
+          })),
+        },
+      };
+    },
+  });
+```
+
+- [ ] **Step 2: `check_reply`（含 TTL 清理）**
+
+```typescript
+  // ─── check_reply Tool ──────────────────────────────────
+
+  pi.registerTool({
+    name: "check_reply",
+    label: "Check Replies",
+    description:
+      "Check for pending async replies from other agents. " +
+      "Call this after using call() with synchronous=false. " +
+      "Optionally filter by sender agent ID.",
+    parameters: Type.Object({
+      from: Type.Optional(Type.String({
+        description: "Optional: filter by sender agent ID",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const from: string | undefined = params.from;
+
+      // TTL cleanup: discard replies older than 1 hour
+      const now = Date.now();
+      for (const [key, replies] of pendingReplies) {
+        const filtered = replies.filter(r => now - r.timestamp < REPLY_TTL_MS);
+        if (filtered.length === 0) {
+          pendingReplies.delete(key);
+        } else {
+          pendingReplies.set(key, filtered);
+        }
+      }
+
+      if (from) {
+        const replies = pendingReplies.get(from) || [];
+        pendingReplies.delete(from);
+        return {
+          content: [{
+            type: "text",
+            text: replies.length === 0
+              ? `没有来自 ${from} 的待收回复。`
+              : replies.map((r) => `[${from}]\n${r.reply}`).join("\n\n"),
+          }],
+          details: { replies },
+        };
+      }
+
+      // Return all
+      const all: PendingReply[] = [];
+      for (const [, replies] of pendingReplies) {
+        all.push(...replies);
+      }
+      pendingReplies.clear();
+
+      return {
+        content: [{
+          type: "text",
+          text: all.length === 0
+            ? "没有待收回复。"
+            : all.map((r) => `[${r.from}]\n${r.reply}`).join("\n\n"),
+        }],
+        details: { replies: all },
+      };
+    },
+  });
+```
+
+---
+
+### Task 7: 生命周期集成
+
+- [ ] **Step 1: 完整钩子**
+
+```typescript
+  // ─── Lifecycle Hooks ───────────────────────────────────
+
+  // Restore roles on /resume
+  pi.on("session_start", async (_event, ctx) => {
+    ensureRegistryDir();
+
+    // Find last role entry in session
+    const entries = ctx.sessionManager.getEntries();
+    let lastRole: RoleData | null = null;
+    for (const entry of entries) {
+      if ((entry as { type?: string; customType?: string }).type === "custom" &&
+          (entry as { customType: string }).customType === ROLE_CUSTOM_TYPE) {
+        lastRole = (entry as { data: RoleData }).data;
+      }
+    }
+
+    if (lastRole && lastRole.roles.length > 0) {
+      startNetwork(lastRole.roles);
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `Restored roles from session: ${lastRole.roles.join(", ")}`,
+          "info"
+        );
+      }
+    }
+  });
+
+  // Clean up on exit
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    stopNetwork();
+  });
+```
+
+- [ ] **Step 2: 收尾闭合**
+
+```typescript
+} // end of export default function
+```
+
+---
+
+### Task 8: 验证
+
+- [ ] **Step 1: 创建 symlink**
+
+```bash
+mkdir -p ~/.pi/agent/extensions
+ln -sf ~/.pi/agent-network/agent-network.ts ~/.pi/agent/extensions/agent-network.ts
+```
+
+- [ ] **Step 2: 启动检查**
+
+```bash
+pi
+# 预期：启动 header 显示 agent-network 扩展已加载
+```
+
+- [ ] **Step 3: 角色注册测试**
+
+```
+/role developer
+# 预期：通知显示已加入，检查 ~/.pi/agent/registry/ 下有 JSON 文件
+```
+
+- [ ] **Step 4: 退出清理测试**
+
+`Ctrl+C` 两次退出，检查 registry 文件已删除。
+
+- [ ] **Step 5: 会话恢复测试**
+
+```bash
+pi -c
+# 预期：通知 "Restored roles from session: developer"
+# registry 文件存在，端口不同
+```
+
+---
+
+## 自检清单
+
+| 检查项 | 状态 |
+|--------|------|
+| API 签名对齐（TypeBox + execute） | ✅ |
+| 死锁预防（同步 call 前置 BUSY） | ✅ |
+| 端口 listen(0) 无 TOCTOU | ✅ |
+| writable 检查 | ✅ |
+| UUID | ✅ |
+| 注册路径统一 `~/.pi/agent/registry/` | ✅ |
+| extractText 安全过滤 | ✅ |
+| 异步回复 TTL 清理 | ✅ |
+| 设计文档全部工具均已覆盖 | ✅ |
+| 无占位符/TODO | ✅ |
