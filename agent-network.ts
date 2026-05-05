@@ -509,6 +509,109 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  // ─── list_agents Tool ──────────────────────────────────
+
+  pi.registerTool({
+    name: "list_agents",
+    label: "List Agents",
+    description:
+      "List all agents currently in the network. " +
+      "Optionally filter by role (e.g. 'reviewer'). " +
+      "Returns agent ID, roles, status, and uptime.",
+    parameters: Type.Object({
+      role: Type.Optional(Type.String({
+        description: "Optional: filter by role name",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const role: string | undefined = params.role;
+      const agents = scanRegistry();
+      const filtered = role
+        ? agents.filter((a) => a.roles.includes(role))
+        : agents;
+
+      return {
+        content: [{
+          type: "text",
+          text: filtered.length === 0
+            ? "没有找到 agent。"
+            : filtered.map((a) =>
+                `[${a.status}] ${a.id} — ${a.roles.join(", ")} (${Math.round((Date.now() - a.startedAt) / 1000)}s)`
+              ).join("\n"),
+        }],
+        details: {
+          agents: filtered.map((a) => ({
+            id: a.id,
+            roles: a.roles,
+            status: a.status,
+            uptime: Math.round((Date.now() - a.startedAt) / 1000),
+          })),
+        },
+      };
+    },
+  });
+
+  // ─── check_reply Tool ──────────────────────────────────
+
+  pi.registerTool({
+    name: "check_reply",
+    label: "Check Replies",
+    description:
+      "Check for pending async replies from other agents. " +
+      "Call this after using call() with synchronous=false. " +
+      "Optionally filter by sender agent ID.",
+    parameters: Type.Object({
+      from: Type.Optional(Type.String({
+        description: "Optional: filter by sender agent ID",
+      })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+      const from: string | undefined = params.from;
+
+      // TTL cleanup: discard replies older than 1 hour
+      const now = Date.now();
+      for (const [key, replies] of pendingReplies) {
+        const filtered = replies.filter(r => now - r.timestamp < REPLY_TTL_MS);
+        if (filtered.length === 0) {
+          pendingReplies.delete(key);
+        } else {
+          pendingReplies.set(key, filtered);
+        }
+      }
+
+      if (from) {
+        const replies = pendingReplies.get(from) || [];
+        pendingReplies.delete(from);
+        return {
+          content: [{
+            type: "text",
+            text: replies.length === 0
+              ? `没有来自 ${from} 的待收回复。`
+              : replies.map((r) => `[${from}]\n${r.reply}`).join("\n\n"),
+          }],
+          details: { replies },
+        };
+      }
+
+      // Return all
+      const all: PendingReply[] = [];
+      for (const [, replies] of pendingReplies) {
+        all.push(...replies);
+      }
+      pendingReplies.clear();
+
+      return {
+        content: [{
+          type: "text",
+          text: all.length === 0
+            ? "没有待收回复。"
+            : all.map((r) => `[${r.from}]\n${r.reply}`).join("\n\n"),
+        }],
+        details: { replies: all },
+      };
+    },
+  });
+
   // ─── Capture & Forward Replies ─────────────────────────
 
   function extractText(message: unknown): string {
