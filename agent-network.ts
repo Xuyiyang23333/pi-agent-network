@@ -816,7 +816,7 @@ export default function (pi: ExtensionAPI) {
       pendingSyncResponse = null;
       updateOwnStatus("idle");
     } else if (pendingSyncResolve) {
-      // Async: stash to pending queue
+      // Async: deliver reply (POST back or stash locally)
       pendingSyncResolve(replyText);
       pendingSyncResolve = null;
       updateOwnStatus("idle");
