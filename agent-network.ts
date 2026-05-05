@@ -31,6 +31,7 @@ interface CallRequest {
   to: string;
   message: string;
   synchronous: boolean;
+  fromRoles?: string[];
 }
 
 interface CallResponse {
@@ -160,6 +161,14 @@ export default function (pi: ExtensionAPI) {
         currentRoles = roles;
         pi.appendEntry(ROLE_CUSTOM_TYPE, { roles } satisfies RoleData);
 
+        pi.sendMessage({
+          customType: ROLE_CUSTOM_TYPE,
+          content: `你已加入 agent 网络，当前角色: ${roles.join("、")}。` +
+            `其他 agent 可以通过 \`call\` 工具调用你，你也可以使用 \`list_agents\` 发现其他 agent，` +
+            `用 \`call\` 与他们通信。`,
+          display: true,
+        });
+
         const info: AgentInfo = {
           id: AGENT_ID,
           roles,
@@ -247,6 +256,11 @@ export default function (pi: ExtensionAPI) {
           startedAt: Date.now(),
         });
         pi.appendEntry(ROLE_CUSTOM_TYPE, { roles: newRoles });
+        pi.sendMessage({
+          customType: ROLE_CUSTOM_TYPE,
+          content: `你的 agent 网络角色已更新为: ${newRoles.join("、")}。`,
+          display: true,
+        });
         ctx.ui.notify(`Roles updated: ${newRoles.join(", ")}`, "info");
       } else {
         startNetwork(newRoles);
@@ -292,6 +306,11 @@ export default function (pi: ExtensionAPI) {
           startedAt: Date.now(),
         });
         pi.appendEntry(ROLE_CUSTOM_TYPE, { roles: currentRoles });
+        pi.sendMessage({
+          customType: ROLE_CUSTOM_TYPE,
+          content: `你的 agent 网络角色已更新为: ${currentRoles.join("、")}。`,
+          display: true,
+        });
       } else {
         await startNetwork(roles);
       }
@@ -367,9 +386,12 @@ export default function (pi: ExtensionAPI) {
       // Mark busy
       updateOwnStatus("busy");
 
+      const senderRoles = callReq.fromRoles?.length
+        ? callReq.fromRoles.join("、")
+        : callReq.to;
       const formattedMsg = callReq.synchronous
-        ? `[同步调用来自 ${callReq.from}，角色: ${callReq.to}]\n${callReq.message}`
-        : `[异步消息来自 ${callReq.from}，角色: ${callReq.to}]\n${callReq.message}`;
+        ? `[同步调用来自 ${callReq.from}，角色: ${senderRoles}]\n${callReq.message}`
+        : `[异步消息来自 ${callReq.from}，角色: ${senderRoles}]\n${callReq.message}`;
 
       if (callReq.synchronous) {
         pendingSyncResponse = res;
@@ -509,6 +531,7 @@ export default function (pi: ExtensionAPI) {
         to,
         message,
         synchronous,
+        fromRoles: currentRoles,
       };
 
       const result = await httpPost(target.host, target.port, requestBody);
