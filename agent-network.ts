@@ -143,30 +143,37 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Role Management ───────────────────────────────────
 
-  function startNetwork(roles: string[]): void {
-    ensureRegistryDir();
+  function startNetwork(roles: string[]): Promise<void> {
+    return new Promise((resolve, reject) => {
+      ensureRegistryDir();
+      httpServer = http.createServer(handleRequest);
+      httpServer.listen(0, "127.0.0.1", () => {
+        const addr = httpServer!.address();
+        if (!addr || typeof addr === "string") {
+          reject(new Error("Failed to get server address"));
+          return;
+        }
+        serverPort = addr.port;
 
-    httpServer = http.createServer(handleRequest);
-    httpServer.listen(0, "127.0.0.1", () => {
-      const addr = httpServer!.address();
-      if (!addr || typeof addr === "string") {
-        throw new Error("Failed to get server address");
-      }
-      serverPort = addr.port;
+        currentRoles = roles;
+        pi.appendEntry(ROLE_CUSTOM_TYPE, { roles } satisfies RoleData);
 
-      const info: AgentInfo = {
-        id: AGENT_ID,
-        roles,
-        host: "127.0.0.1",
-        port: serverPort,
-        status: "idle",
-        startedAt: Date.now(),
-      };
-      writeOwnRegistry(info);
+        const info: AgentInfo = {
+          id: AGENT_ID,
+          roles,
+          host: "127.0.0.1",
+          port: serverPort,
+          status: "idle",
+          startedAt: Date.now(),
+        };
+        writeOwnRegistry(info);
+        resolve();
+      });
+
+      httpServer.on("error", (err) => {
+        reject(err);
+      });
     });
-
-    currentRoles = roles;
-    pi.appendEntry(ROLE_CUSTOM_TYPE, { roles } satisfies RoleData);
   }
 
   function stopNetwork(): void {
@@ -179,6 +186,7 @@ export default function (pi: ExtensionAPI) {
     currentRoles = [];
     pendingSyncResponse = null;
     pendingSyncResolve = null;
+    pendingReplies.clear();
   }
 
   // ─── /role Command ─────────────────────────────────────
