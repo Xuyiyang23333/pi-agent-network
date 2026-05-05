@@ -6,6 +6,7 @@
  */
 
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { keyHint } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "typebox";
 import * as http from "node:http";
@@ -569,10 +570,21 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, _options, theme, context) {
       const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
       const details = result.details as Record<string, unknown> | undefined;
+      const expanded = _options.expanded as boolean;
+
       if (details?.error) {
         text.setText(theme.fg("error", `⚠ ${details.error}`));
       } else if (details?.reply) {
-        text.setText(theme.fg("dim", `← ${(details.reply as string).slice(0, 200)}`));
+        const reply = details.reply as string;
+        if (expanded) {
+          text.setText(theme.fg("dim", "← " + reply));
+        } else {
+          const preview = reply.length > 200 ? reply.slice(0, 200) + "…" : reply;
+          text.setText(
+            theme.fg("dim", `← ${preview}`) +
+            (reply.length > 200 ? " " + theme.fg("muted", `(${reply.length} chars, ${keyHint("app.tools.expand", "expand")})`) : "")
+          );
+        }
       } else if (details?.accepted) {
         text.setText(theme.fg("muted", "📨 已发送"));
       }
