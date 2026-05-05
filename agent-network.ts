@@ -273,7 +273,7 @@ export default function (pi: ExtensionAPI) {
         });
         ctx.ui.notify(`Roles updated: ${newRoles.join(", ")}`, "info");
       } else {
-        startNetwork(newRoles);
+        await startNetwork(newRoles);
         ctx.ui.notify(
           `Joining agent network as: ${newRoles.join(", ")}`,
           "info"
@@ -408,7 +408,7 @@ export default function (pi: ExtensionAPI) {
 
       const senderRoles = callReq.fromRoles?.length
         ? callReq.fromRoles.join("、")
-        : callReq.to;
+        : `(unknown, id=${callReq.from.slice(0, 8)})`;
       const formattedMsg = callReq.synchronous
         ? `[同步调用来自 ${callReq.from}，角色: ${senderRoles}]\n${callReq.message}`
         : `[异步消息来自 ${callReq.from}，角色: ${senderRoles}]\n${callReq.message}`;
