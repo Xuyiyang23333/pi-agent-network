@@ -305,4 +305,111 @@ export default function (pi: ExtensionAPI) {
       };
     },
   });
+
+  // ─── HTTP Server ───────────────────────────────────────
+
+  function handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
+    if (req.method !== "POST" || req.url !== "/message") {
+      res.writeHead(404);
+      res.end("not found");
+      return;
+    }
+
+    let body = "";
+    req.on("data", (chunk) => (body += chunk));
+    req.on("end", () => {
+      let callReq: CallRequest;
+      try {
+        callReq = JSON.parse(body);
+      } catch {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: "invalid json" }));
+        return;
+      }
+
+      // Check if we're busy
+      const ownInfo = readOwnRegistry();
+      if (ownInfo && ownInfo.status === "busy") {
+        res.writeHead(409);
+        res.end(JSON.stringify({ error: "busy" }));
+        return;
+      }
+
+      // Mark busy
+      updateOwnStatus("busy");
+
+      const formattedMsg = `[来自 ${callReq.from} (${callReq.to})]\n${callReq.message}`;
+
+      if (callReq.synchronous) {
+        pendingSyncResponse = res;
+        pendingSyncResolve = null;
+        pi.sendUserMessage(formattedMsg);
+        // Response sent in agent_end handler
+      } else {
+        // Async: accept immediately
+        res.writeHead(202);
+        res.end(JSON.stringify({ accepted: true }));
+
+        pendingSyncResolve = (reply: string) => {
+          const replies = pendingReplies.get(callReq.from) || [];
+          replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
+          pendingReplies.set(callReq.from, replies);
+        };
+
+        pi.sendUserMessage(formattedMsg);
+      }
+    });
+  }
+
+  // ─── Capture & Forward Replies ─────────────────────────
+
+  function extractText(message: unknown): string {
+    if (!message) return "(no response)";
+    if (typeof message === "string") return message;
+    if (typeof message === "object" && message !== null && "content" in message) {
+      const content = (message as { content: unknown }).content;
+      if (typeof content === "string") return content;
+      if (Array.isArray(content)) {
+        return content
+          .filter(
+            (b: unknown) =>
+              typeof b === "object" && b !== null &&
+              "type" in b && (b as { type: string }).type === "text" &&
+              "text" in b && typeof (b as { text: unknown }).text === "string"
+          )
+          .map((b) => (b as { text: string }).text)
+          .join("\n");
+      }
+    }
+    return "(no response)";
+  }
+
+  pi.on("agent_end", async (event) => {
+    if (!pendingSyncResponse && !pendingSyncResolve) return;
+
+    const assistantMessages = (event.messages as Array<{ role: string; content?: unknown }>).filter(
+      (m) => m.role === "assistant"
+    );
+    const lastAssistant = assistantMessages[assistantMessages.length - 1];
+    const replyText = extractText(lastAssistant);
+
+    // Sync: send HTTP response
+    if (pendingSyncResponse) {
+      if (pendingSyncResponse.writable) {
+        pendingSyncResponse.writeHead(200, {
+          "Content-Type": "application/json",
+        });
+        pendingSyncResponse.end(JSON.stringify({ reply: replyText }));
+      }
+      pendingSyncResponse = null;
+      updateOwnStatus("idle");
+    }
+
+    // Async: stash to pending queue
+    if (pendingSyncResolve) {
+      pendingSyncResolve(replyText);
+      pendingSyncResolve = null;
+      updateOwnStatus("idle");
+    }
+  });
 }
