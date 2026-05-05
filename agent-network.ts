@@ -663,4 +663,37 @@ export default function (pi: ExtensionAPI) {
       updateOwnStatus("idle");
     }
   });
+
+  // ─── Lifecycle: Restore Roles on /resume ───────────────
+
+  pi.on("session_start", async (_event, ctx) => {
+    ensureRegistryDir();
+
+    const entries = ctx.sessionManager.getEntries();
+    let lastRole: RoleData | null = null;
+    for (const entry of entries) {
+      if (
+        (entry as { type?: string; customType?: string }).type === "custom" &&
+        (entry as { customType: string }).customType === ROLE_CUSTOM_TYPE
+      ) {
+        lastRole = (entry as { data: RoleData }).data;
+      }
+    }
+
+    if (lastRole && lastRole.roles.length > 0) {
+      startNetwork(lastRole.roles);
+      if (ctx.hasUI) {
+        ctx.ui.notify(
+          `Restored roles from session: ${lastRole.roles.join(", ")}`,
+          "info"
+        );
+      }
+    }
+  });
+
+  // ─── Lifecycle: Clean Up on Exit ───────────────────────
+
+  pi.on("session_shutdown", async (_event, _ctx) => {
+    stopNetwork();
+  });
 }
