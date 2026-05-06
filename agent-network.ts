@@ -581,11 +581,15 @@ export default function (pi: ExtensionAPI) {
       "with your answer directly — your response text is forwarded automatically. " +
       "Do NOT use the call tool to reply.",
       "When you receive a message prefixed with [异步消息] 来自 ..., " +
-      "the caller is NOT waiting. You may use the call tool later to respond " +
-      "if needed.",
+      "the caller is NOT waiting. Your reply will be delivered back automatically. " +
+      "You may also use the call tool to respond manually if needed (duplicates are prevented).",
       "After calling another agent with synchronous=false, do NOT wait or poll. " +
       "Your message has been delivered. End your turn. Use check_reply later " +
       "to see if a response has arrived.",
+      "When you receive a message prefixed with [异步回复] 来自 ..., " +
+      "this is a reply to your previous async request. " +
+      "Read and process it directly — do NOT reply or use the call tool to respond. " +
+      "Your response to the original async request has already been delivered.",
     ],
     parameters: Type.Object({
       to: Type.String({
@@ -838,7 +842,8 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Check for pending replies from async calls to other agents",
     promptGuidelines: [
       "After using call() with synchronous=false, the other agent may reply later. " +
-      "Use check_reply to retrieve any pending responses when you are ready to read them. " +
+      "The system will automatically notify you when pending replies arrive (while you were busy). " +
+      "Wait for the notification, then use check_reply to retrieve them. " +
       "Do NOT call check_reply in a loop — check once per turn or when the user asks.",
     ],
     parameters: Type.Object({
