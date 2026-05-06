@@ -22,7 +22,7 @@ interface AgentInfo {
   roles: string[];
   host: string;
   port: number;
-  status: "idle" | "busy" | "offline";
+  status: "idle" | "busy";
   startedAt: number;
 }
 
@@ -114,7 +114,7 @@ export default function (pi: ExtensionAPI) {
     if (fs.existsSync(p)) fs.unlinkSync(p);
   }
 
-  function updateOwnStatus(status: "idle" | "busy" | "offline"): void {
+  function updateOwnStatus(status: "idle" | "busy"): void {
     const info = readOwnRegistry();
     if (!info) return;
     info.status = status;
@@ -142,16 +142,10 @@ export default function (pi: ExtensionAPI) {
 
   function markOffline(agentId: string): void {
     const p = registryPath(agentId);
-    if (!fs.existsSync(p)) return;
     try {
-      const info: AgentInfo = JSON.parse(fs.readFileSync(p, "utf-8"));
-      // NOTE: read-modify-write is not atomic — if the target agent
-      // simultaneously updates its own status, offline may overwrite idle.
-      // Probability is negligible in local single-machine scenarios.
-      info.status = "offline";
-      fs.writeFileSync(p, JSON.stringify(info, null, 2));
+      if (fs.existsSync(p)) fs.unlinkSync(p);
     } catch {
-      // ignore — file may be corrupted or deleted concurrently
+      // ignore — file may be deleted concurrently
     }
   }
 
@@ -589,7 +583,6 @@ export default function (pi: ExtensionAPI) {
       const agents = scanRegistry();
       const candidates = agents.filter(
         (a) =>
-          a.status !== "offline" &&
           a.roles.includes(to) &&
           a.id !== AGENT_ID
       );
