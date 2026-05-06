@@ -424,7 +424,7 @@ export default function (pi: ExtensionAPI) {
         wasBusy = true;
         updateOwnStatus("busy");
         pendingSyncResolve = async () => {}; // dummy: trigger idle restore in agent_end
-        pi.sendUserMessage(formattedMsg);
+        pi.sendUserMessage(formattedMsg, { deliverAs: "followUp" });
         res.writeHead(200);
         res.end(JSON.stringify({ accepted: true }));
         return;
@@ -452,7 +452,7 @@ export default function (pi: ExtensionAPI) {
       if (callReq.synchronous) {
         pendingSyncResponse = res;
         pendingSyncResolve = null;
-        pi.sendUserMessage(formattedMsg);
+        pi.sendUserMessage(formattedMsg, { deliverAs: "steer" });
         // Response sent in agent_end handler
       } else {
         // Async: accept immediately
@@ -488,7 +488,7 @@ export default function (pi: ExtensionAPI) {
           };
         };
 
-        pi.sendUserMessage(formattedMsg);
+        pi.sendUserMessage(formattedMsg, { deliverAs: "followUp" });
       }
     });
   }
