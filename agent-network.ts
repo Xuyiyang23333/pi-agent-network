@@ -122,7 +122,10 @@ export default function (pi: ExtensionAPI) {
 
   function writeOwnRegistry(info: AgentInfo): void {
     ensureRegistryDir();
-    fs.writeFileSync(registryPath(AGENT_ID), JSON.stringify(info, null, 2));
+    const p = registryPath(AGENT_ID);
+    const tmp = p + ".tmp";
+    fs.writeFileSync(tmp, JSON.stringify(info, null, 2));
+    fs.renameSync(tmp, p);
   }
 
   function deleteOwnRegistry(): void {
