@@ -77,6 +77,11 @@ export default function (pi: ExtensionAPI) {
   // Track busy→idle transition for pending-reply notification
   let wasBusy = false;
 
+  // Track async reply avoidance: if LLM already called the caller back,
+  // skip the agent_end isReply delivery to avoid double-delivery.
+  let pendingAsyncCaller: string | null = null;
+  let callerRepliedViaCall: boolean = false;
+
   // ─── Registry Helpers ──────────────────────────────────
 
   function ensureRegistryDir(): void {
@@ -205,6 +210,8 @@ export default function (pi: ExtensionAPI) {
     pendingSyncResolve = null;
     pendingReplies.clear();
     wasBusy = false;
+    pendingAsyncCaller = null;
+    callerRepliedViaCall = false;
   }
 
   // ─── /role Command ─────────────────────────────────────
@@ -462,6 +469,7 @@ export default function (pi: ExtensionAPI) {
         // decides the delivery path based on its own (accurate) status.
         // Dead-letter fallback if the caller is unreachable.
         if (callReq.replyHost && callReq.replyPort) {
+          pendingAsyncCaller = callReq.from;
           pendingSyncResolve = async (reply: string) => {
             const result = await httpPost(callReq.replyHost as string, callReq.replyPort as number, {
               from: AGENT_ID,
@@ -644,6 +652,10 @@ export default function (pi: ExtensionAPI) {
           details: { reply: result.reply, from: target.id },
         };
       } else {
+        // Track if LLM replied to the pending async caller (avoid double-delivery)
+        if (pendingAsyncCaller && target.id === pendingAsyncCaller) {
+          callerRepliedViaCall = true;
+        }
         return {
           content: [{
             type: "text",
@@ -843,12 +855,23 @@ export default function (pi: ExtensionAPI) {
         pendingSyncResponse.end(JSON.stringify({ reply: replyText }));
       }
       pendingSyncResponse = null;
+      pendingAsyncCaller = null;
+      callerRepliedViaCall = false;
       updateOwnStatus("idle");
     } else if (pendingSyncResolve) {
       // Async: deliver reply (POST back or stash locally)
-      await pendingSyncResolve(replyText);
-      pendingSyncResolve = null;
-      updateOwnStatus("idle");
+      if (callerRepliedViaCall) {
+        // LLM already replied via call tool, skip isReply to avoid double-delivery
+        pendingSyncResolve = null;
+        pendingAsyncCaller = null;
+        callerRepliedViaCall = false;
+        updateOwnStatus("idle");
+      } else {
+        await pendingSyncResolve(replyText);
+        pendingSyncResolve = null;
+        pendingAsyncCaller = null;
+        updateOwnStatus("idle");
+      }
     }
 
     // Notify LLM about pending replies collected while busy
