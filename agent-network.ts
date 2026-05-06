@@ -56,6 +56,7 @@ interface RoleData {
 // ─── Constants ───────────────────────────────────────────
 
 const REGISTRY_DIR = path.join(os.homedir(), ".pi", "agent", "registry");
+const STATUS_KEY = "agent-roles";
 const ROLE_CUSTOM_TYPE = "agent-network-role";
 const AGENT_ID = randomUUID();
 const REPLY_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -81,6 +82,21 @@ export default function (pi: ExtensionAPI) {
   // skip the agent_end isReply delivery to avoid double-delivery.
   let pendingAsyncCaller: string | null = null;
   let callerRepliedViaCall: boolean = false;
+
+  // Footer status display — stored from session_start
+  let storedUi: {
+    setStatus(key: string, text: string | undefined): void;
+    theme: { fg(color: string, text: string): string };
+  } | null = null;
+
+  function updateFooterStatus(roles: string[]): void {
+    if (!storedUi) return;
+    if (roles.length === 0) {
+      storedUi.setStatus(STATUS_KEY, undefined);
+    } else {
+      storedUi.setStatus(STATUS_KEY, storedUi.theme.fg("accent", "🎭 " + roles.join(", ")));
+    }
+  }
 
   // ─── Registry Helpers ──────────────────────────────────
 
@@ -222,6 +238,7 @@ export default function (pi: ExtensionAPI) {
           display: true,
         });
         stopNetwork();
+        updateFooterStatus([]);
         ctx.ui.notify("Roles cleared, left agent network", "info");
         return;
       }
@@ -259,6 +276,7 @@ export default function (pi: ExtensionAPI) {
           display: true,
         });
         stopNetwork();
+        updateFooterStatus([]);
         ctx.ui.notify("Roles cleared, left agent network", "info");
         return;
       }
@@ -279,9 +297,11 @@ export default function (pi: ExtensionAPI) {
           content: `你的 agent 网络角色已更新为: ${newRoles.join("、")}。`,
           display: true,
         });
+        updateFooterStatus(newRoles);
         ctx.ui.notify(`Roles updated: ${newRoles.join(", ")}`, "info");
       } else {
         await startNetwork(newRoles);
+        updateFooterStatus(newRoles);
         ctx.ui.notify(
           `Joining agent network as: ${newRoles.join(", ")}`,
           "info"
@@ -313,6 +333,7 @@ export default function (pi: ExtensionAPI) {
           display: true,
         });
         stopNetwork();
+        updateFooterStatus([]);
         return {
           content: [{ type: "text", text: "All roles removed." }],
           details: {},
@@ -334,8 +355,10 @@ export default function (pi: ExtensionAPI) {
           content: `你的 agent 网络角色已更新为: ${currentRoles.join("、")}。`,
           display: true,
         });
+        updateFooterStatus(currentRoles);
       } else {
         await startNetwork(roles);
+        updateFooterStatus(roles);
       }
       return {
         content: [{
@@ -359,6 +382,7 @@ export default function (pi: ExtensionAPI) {
         display: true,
       });
       stopNetwork();
+      updateFooterStatus([]);
       return {
         content: [{ type: "text", text: "Left the agent network." }],
         details: {},
@@ -885,6 +909,7 @@ export default function (pi: ExtensionAPI) {
   // ─── Lifecycle: Restore Roles on /resume ───────────────
 
   pi.on("session_start", async (_event, ctx) => {
+    storedUi = ctx.ui;
     ensureRegistryDir();
 
     const entries = ctx.sessionManager.getEntries();
@@ -900,6 +925,7 @@ export default function (pi: ExtensionAPI) {
 
     if (lastRole && lastRole.roles.length > 0) {
       await startNetwork(lastRole.roles);
+      updateFooterStatus(lastRole.roles);
       if (ctx.hasUI) {
         ctx.ui.notify(
           `Restored roles from session: ${lastRole.roles.join(", ")}`,
@@ -912,6 +938,7 @@ export default function (pi: ExtensionAPI) {
   // ─── Lifecycle: Clean Up on Exit ───────────────────────
 
   pi.on("session_shutdown", async (_event, _ctx) => {
+    updateFooterStatus([]);
     stopNetwork();
   });
 }
