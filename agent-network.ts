@@ -587,7 +587,7 @@ export default function (pi: ExtensionAPI) {
     ],
     parameters: Type.Object({
       to: Type.String({
-        description: "Target role name, e.g. 'reviewer', 'tester'",
+        description: "Target role name, e.g. 'reviewer', 'tester'. Use comma to target multiple roles (async only).",
       }),
       message: Type.String({
         description: "Message to send to the target agent",
@@ -600,88 +600,145 @@ export default function (pi: ExtensionAPI) {
       const to: string = params.to;
       const message: string = params.message;
       const synchronous: boolean = params.synchronous ?? true;
+      const targetRoles = to.split(",").map(s => s.trim()).filter(Boolean);
+
+      if (targetRoles.length === 0) {
+        return {
+          content: [{ type: "text", text: "未指定目标角色。" }],
+          details: { error: "no target" },
+        };
+      }
+
+      if (synchronous && targetRoles.length > 1) {
+        return {
+          content: [{ type: "text", text: "多目标仅支持异步模式（synchronous: false）。" }],
+          details: { error: "multi-target requires async" },
+        };
+      }
 
       // Deadlock prevention: mark self BUSY before blocking on outbound sync call
       if (synchronous) {
         updateOwnStatus("busy");
       }
 
-      // Find target
       const agents = scanRegistry();
-      const candidates = agents.filter(
-        (a) =>
-          a.roles.includes(to) &&
-          a.id !== AGENT_ID
-      );
 
-      if (candidates.length === 0) {
-        if (synchronous) updateOwnStatus("idle");
-        return {
-          content: [{
-            type: "text",
-            text: `没有找到可用的 '${to}' 角色的 agent。`,
-          }],
-          details: { error: `no ${to} agent available` },
-        };
+      // Resolve target agent for each role
+      const resolved: { role: string; agent: AgentInfo | null; error?: string }[] = [];
+      for (const role of targetRoles) {
+        const candidates = agents.filter(
+          (a) => a.roles.includes(role) && a.id !== AGENT_ID
+        );
+        if (candidates.length === 0) {
+          resolved.push({ role, agent: null, error: "no agent" });
+          continue;
+        }
+        // Prefer idle
+        const idle = candidates.filter((a) => a.status === "idle");
+        const target = idle.length > 0
+          ? idle[Math.floor(Math.random() * idle.length)]
+          : candidates[0];
+        resolved.push({ role, agent: target });
       }
 
-      // Prefer idle
-      const idleCandidates = candidates.filter((a) => a.status === "idle");
-      const target = idleCandidates.length > 0
-        ? idleCandidates[Math.floor(Math.random() * idleCandidates.length)]
-        : candidates[0];
-
-      const requestBody: CallRequest = {
-        from: AGENT_ID,
-        to,
-        message,
-        synchronous,
-        fromRoles: currentRoles,
-        ...(synchronous ? {} : { replyHost: "127.0.0.1", replyPort: serverPort }),
-      };
-
-      const result = await httpPost(target.host, target.port, requestBody);
-
-      if (result.error === "busy") {
-        if (synchronous) updateOwnStatus("idle");
-        return {
-          content: [{
-            type: "text",
-            text: `${to} (${target.id}) 正忙，请稍后重试。`,
-          }],
-          details: { error: "busy", agentId: target.id },
-        };
-      }
-
-      if (result.error) {
-        markOffline(target.id);
-        if (synchronous) updateOwnStatus("idle");
-        return {
-          content: [{
-            type: "text",
-            text: `${to} (${target.id}) 无法连接，已标记为离线。`,
-          }],
-          details: { error: "connection failed", agentId: target.id },
-        };
-      }
-
+      // ── Synchronous single-target (original behavior) ──
       if (synchronous) {
+        const { role, agent } = resolved[0];
+        if (!agent) {
+          updateOwnStatus("idle");
+          return {
+            content: [{ type: "text", text: `没有找到可用的 '${role}' 角色的 agent。` }],
+            details: { error: `no ${role} agent available` },
+          };
+        }
+        const t = agent;
+        const requestBody: CallRequest = {
+          from: AGENT_ID, to: role, message, synchronous: true,
+          fromRoles: currentRoles,
+        };
+        const result = await httpPost(t.host, t.port, requestBody);
+
+        if (result.error === "busy") {
+          updateOwnStatus("idle");
+          return {
+            content: [{ type: "text", text: `${role} (${t.id}) 正忙，请稍后重试。` }],
+            details: { error: "busy", agentId: t.id },
+          };
+        }
+        if (result.error) {
+          markOffline(t.id);
+          updateOwnStatus("idle");
+          return {
+            content: [{ type: "text", text: `${role} (${t.id}) 无法连接，已标记为离线。` }],
+            details: { error: "connection failed", agentId: t.id },
+          };
+        }
         updateOwnStatus("idle");
         return {
           content: [{ type: "text", text: result.reply || "(empty reply)" }],
-          details: { reply: result.reply, from: target.id },
+          details: { reply: result.reply, from: t.id },
         };
-      } else {
-        // Track if LLM replied to the pending async caller (avoid double-delivery)
-        if (pendingAsyncCaller && target.id === pendingAsyncCaller) {
+      }
+
+      // ── Async — parallel send to all resolved targets ──
+      const sendPromises = resolved.map(async ({ role, agent, error }) => {
+        if (!agent) return { role, error: error! };
+        const t = agent;
+        const requestBody: CallRequest = {
+          from: AGENT_ID, to: role, message, synchronous: false,
+          fromRoles: currentRoles,
+          replyHost: "127.0.0.1", replyPort: serverPort,
+        };
+        const result = await httpPost(t.host, t.port, requestBody);
+        if (result.error === "busy") return { role, agentId: t.id, error: "busy" };
+        if (result.error) {
+          markOffline(t.id);
+          return { role, agentId: t.id, error: "connection failed" };
+        }
+        // Track for double-delivery avoidance
+        if (pendingAsyncCaller && t.id === pendingAsyncCaller) {
           callerRepliedViaCall = true;
         }
+        return { role, agentId: t.id };
+      });
+
+      const results = await Promise.all(sendPromises);
+      const sent = results.filter(r => !r.error).length;
+      const isMulti = targetRoles.length > 1;
+
+      if (isMulti) {
+        const lines = [`已发送给 ${sent}/${targetRoles.length} 个角色。`];
+        for (const r of results) {
+          if (r.error) lines.push(`  ${r.role}: ${r.error}`);
+          else lines.push(`  ${r.role} (${r.agentId})`);
+        }
         return {
-          content: [{
-            type: "text",
-            text: `已发送给 ${to} (${target.id})`,
-          }],
-          details: { accepted: true, agentId: target.id },
+          content: [{ type: "text", text: lines.join("\n") }],
+          details: { results },
+        };
+      } else {
+        const r = results[0];
+        if (r.error === "no agent") {
+          return {
+            content: [{ type: "text", text: `没有找到可用的 '${r.role}' 角色的 agent。` }],
+            details: { error: `no ${r.role} agent available` },
+          };
+        }
+        if (r.error === "busy") {
+          return {
+            content: [{ type: "text", text: `${r.role} (${r.agentId}) 正忙，请稍后重试。` }],
+            details: { error: "busy", agentId: r.agentId },
+          };
+        }
+        if (r.error) {
+          return {
+            content: [{ type: "text", text: `${r.role} (${r.agentId}) 无法连接，已标记为离线。` }],
+            details: { error: "connection failed", agentId: r.agentId },
+          };
+        }
+        return {
+          content: [{ type: "text", text: `已发送给 ${r.role} (${r.agentId})` }],
+          details: { accepted: true, agentId: r.agentId },
         };
       }
     },
