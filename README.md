@@ -93,6 +93,10 @@ pi-agent-network/
 └── LICENSE             # MPL 2.0
 ```
 
+## 深入
+
+架构设计详见 [docs/architecture.md](docs/architecture.md)
+
 ## 许可证
 
 MPL 2.0 — 详见 [LICENSE](LICENSE)
