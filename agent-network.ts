@@ -68,11 +68,14 @@ export default function (pi: ExtensionAPI) {
   let serverPort: number = 0;
 
   // Incoming synchronous call: resolve when agent_end fires
-  let pendingSyncResolve: ((reply: string) => void) | null = null;
+  let pendingSyncResolve: ((reply: string) => Promise<void>) | null = null;
   let pendingSyncResponse: http.ServerResponse | null = null;
 
   // Pending async replies: Map<callerId, PendingReply[]>
   const pendingReplies = new Map<string, PendingReply[]>();
+
+  // Track busy→idle transition for pending-reply notification
+  let wasBusy = false;
 
   // ─── Registry Helpers ──────────────────────────────────
 
@@ -88,6 +91,16 @@ export default function (pi: ExtensionAPI) {
 
   function readOwnRegistry(): AgentInfo | null {
     const p = registryPath(AGENT_ID);
+    if (!fs.existsSync(p)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(p, "utf-8"));
+    } catch {
+      return null;
+    }
+  }
+
+  function readAgentRegistry(id: string): AgentInfo | null {
+    const p = registryPath(id);
     if (!fs.existsSync(p)) return null;
     try {
       return JSON.parse(fs.readFileSync(p, "utf-8"));
@@ -201,6 +214,7 @@ export default function (pi: ExtensionAPI) {
     pendingSyncResponse = null;
     pendingSyncResolve = null;
     pendingReplies.clear();
+    wasBusy = false;
   }
 
   // ─── /role Command ─────────────────────────────────────
@@ -417,6 +431,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // Mark busy
+      wasBusy = true;
       updateOwnStatus("busy");
 
       const senderRoles = callReq.fromRoles?.length
@@ -436,11 +451,28 @@ export default function (pi: ExtensionAPI) {
         res.writeHead(202);
         res.end(JSON.stringify({ accepted: true }));
 
-        // If caller provided reply address, POST the reply back directly.
-        // Otherwise fall back to storing locally (backward compat with old callers).
+        // Deliver reply: if caller is idle, inject directly (no mailbox).
+        // Otherwise or on failure, use isReply mailbox. Old callers without
+        // reply address still fall back to local storage.
         if (callReq.replyHost && callReq.replyPort) {
-          pendingSyncResolve = (reply: string) => {
-            httpPost(callReq.replyHost as string, callReq.replyPort as number, {
+          pendingSyncResolve = async (reply: string) => {
+            const callerInfo = readAgentRegistry(callReq.from);
+            const callerIsIdle = callerInfo?.status === "idle";
+
+            // Try direct delivery when caller is idle
+            if (callerIsIdle) {
+              const result = await httpPost(callReq.replyHost as string, callReq.replyPort as number, {
+                from: AGENT_ID,
+                to: callReq.from,
+                message: reply,
+                synchronous: false,
+                fromRoles: currentRoles,
+              });
+              if (!result.error) return; // Injected directly into caller's conversation
+            }
+
+            // Mailbox delivery (caller busy or direct failed)
+            const mbResult = await httpPost(callReq.replyHost as string, callReq.replyPort as number, {
               from: AGENT_ID,
               to: callReq.from,
               message: reply,
@@ -448,9 +480,15 @@ export default function (pi: ExtensionAPI) {
               fromRoles: currentRoles,
               isReply: true,
             });
+            if (mbResult.error) {
+              // Dead letter: store locally so it isn't silently lost
+              const replies = pendingReplies.get(callReq.from) || [];
+              replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
+              pendingReplies.set(callReq.from, replies);
+            }
           };
         } else {
-          pendingSyncResolve = (reply: string) => {
+          pendingSyncResolve = async (reply: string) => {
             const replies = pendingReplies.get(callReq.from) || [];
             replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
             pendingReplies.set(callReq.from, replies);
@@ -817,9 +855,23 @@ export default function (pi: ExtensionAPI) {
       updateOwnStatus("idle");
     } else if (pendingSyncResolve) {
       // Async: deliver reply (POST back or stash locally)
-      pendingSyncResolve(replyText);
+      await pendingSyncResolve(replyText);
       pendingSyncResolve = null;
       updateOwnStatus("idle");
+    }
+
+    // Notify LLM about pending replies collected while busy
+    if (wasBusy) {
+      let count = 0;
+      for (const [, replies] of pendingReplies) count += replies.length;
+      if (count > 0) {
+        pi.sendMessage({
+          customType: "agent-network-reply-notify",
+          content: `你有 ${count} 条待收回复（来自异步调用），可以用 check_reply 查看。`,
+          display: true,
+        });
+      }
+      wasBusy = false;
     }
   });
 
