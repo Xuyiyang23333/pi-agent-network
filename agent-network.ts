@@ -131,6 +131,8 @@ export default function (pi: ExtensionAPI) {
   function deleteOwnRegistry(): void {
     const p = registryPath(AGENT_ID);
     if (fs.existsSync(p)) fs.unlinkSync(p);
+    const tmp = p + ".tmp";
+    if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
   }
 
   function updateOwnStatus(status: "idle" | "busy"): void {
