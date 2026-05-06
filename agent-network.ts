@@ -99,16 +99,6 @@ export default function (pi: ExtensionAPI) {
     }
   }
 
-  function readAgentRegistry(id: string): AgentInfo | null {
-    const p = registryPath(id);
-    if (!fs.existsSync(p)) return null;
-    try {
-      return JSON.parse(fs.readFileSync(p, "utf-8"));
-    } catch {
-      return null;
-    }
-  }
-
   function writeOwnRegistry(info: AgentInfo): void {
     ensureRegistryDir();
     fs.writeFileSync(registryPath(AGENT_ID), JSON.stringify(info, null, 2));
@@ -412,11 +402,28 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // Fast path: incoming async reply — store directly, no LLM processing
+      // Incoming async reply: if we're busy, store in mailbox;
+      // if idle, inject directly into conversation with [异步回复] prefix.
       if (callReq.isReply) {
-        const replies = pendingReplies.get(callReq.from) || [];
-        replies.push({ from: callReq.from, reply: callReq.message, timestamp: Date.now() });
-        pendingReplies.set(callReq.from, replies);
+        const ownInfo = readOwnRegistry();
+        if (ownInfo?.status === "busy") {
+          // Busy: store in mailbox for later check_reply
+          const replies = pendingReplies.get(callReq.from) || [];
+          replies.push({ from: callReq.from, reply: callReq.message, timestamp: Date.now() });
+          pendingReplies.set(callReq.from, replies);
+          res.writeHead(200);
+          res.end(JSON.stringify({ accepted: true }));
+          return;
+        }
+        // Idle: inject directly — LLM sees it immediately
+        const senderRoles = callReq.fromRoles?.length
+          ? callReq.fromRoles.join("、")
+          : `(unknown, id=${callReq.from.slice(0, 8)})`;
+        const formattedMsg = `[异步回复] 来自 ${callReq.from.slice(0, 8)}，发送方: ${senderRoles}\n${callReq.message}`;
+        wasBusy = true;
+        updateOwnStatus("busy");
+        pendingSyncResolve = async () => {}; // dummy: trigger idle restore in agent_end
+        pi.sendUserMessage(formattedMsg);
         res.writeHead(200);
         res.end(JSON.stringify({ accepted: true }));
         return;
@@ -451,28 +458,12 @@ export default function (pi: ExtensionAPI) {
         res.writeHead(202);
         res.end(JSON.stringify({ accepted: true }));
 
-        // Deliver reply: if caller is idle, inject directly (no mailbox).
-        // Otherwise or on failure, use isReply mailbox. Old callers without
-        // reply address still fall back to local storage.
+        // Receiver always sends isReply: true — the caller's handleRequest
+        // decides the delivery path based on its own (accurate) status.
+        // Dead-letter fallback if the caller is unreachable.
         if (callReq.replyHost && callReq.replyPort) {
           pendingSyncResolve = async (reply: string) => {
-            const callerInfo = readAgentRegistry(callReq.from);
-            const callerIsIdle = callerInfo?.status === "idle";
-
-            // Try direct delivery when caller is idle
-            if (callerIsIdle) {
-              const result = await httpPost(callReq.replyHost as string, callReq.replyPort as number, {
-                from: AGENT_ID,
-                to: callReq.from,
-                message: reply,
-                synchronous: false,
-                fromRoles: currentRoles,
-              });
-              if (!result.error) return; // Injected directly into caller's conversation
-            }
-
-            // Mailbox delivery (caller busy or direct failed)
-            const mbResult = await httpPost(callReq.replyHost as string, callReq.replyPort as number, {
+            const result = await httpPost(callReq.replyHost as string, callReq.replyPort as number, {
               from: AGENT_ID,
               to: callReq.from,
               message: reply,
@@ -480,7 +471,7 @@ export default function (pi: ExtensionAPI) {
               fromRoles: currentRoles,
               isReply: true,
             });
-            if (mbResult.error) {
+            if (result.error) {
               // Dead letter: store locally so it isn't silently lost
               const replies = pendingReplies.get(callReq.from) || [];
               replies.push({ from: AGENT_ID, reply, timestamp: Date.now() });
